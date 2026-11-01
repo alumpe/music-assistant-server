@@ -12,7 +12,7 @@ import pytest
 from aioslimproto.models import EventType as SlimEventType
 from aioslimproto.models import PlayerState as SlimPlayerState
 from aioslimproto.models import SlimEvent
-from music_assistant_models.enums import MediaType, PlaybackState
+from music_assistant_models.enums import MediaType, PlaybackState, PlayerType
 from music_assistant_models.player import PlayerMedia
 
 from music_assistant.constants import (
@@ -233,8 +233,10 @@ def _stalled_player() -> tuple[SqueezelitePlayer, MagicMock]:
     player._stream_generation = 0
     player._provider = MagicMock(mass=mass)
     player.client = client = MagicMock(state=SlimPlayerState.BUFFERING, jiffies=123456)
+    client.connected = True
     client.unpause_at = AsyncMock()
     client.play_url = AsyncMock()
+    client.stop = AsyncMock()
     mass.players.get_player.return_value = player
     mass.player_queues.get.return_value = None
     mass.streams.resolve_stream_url = AsyncMock(return_value="http://127.0.0.1:8097/x.flac")
@@ -246,13 +248,16 @@ async def _underrun(
     mass: MagicMock,
     during_wait: Any = None,
     group_members: list[str] | None = None,
+    synced_to: str | None = None,
 ) -> None:
     """Report an output underrun and wait for the provider to handle it."""
     with (
         patch("music_assistant.providers.squeezelite.player.UNDERRUN_RESUME_DELAY", 0.05),
         patch("music_assistant.providers.squeezelite.player.UNDERRUN_RESUME_CHECK_DELAY", 0.05),
         patch.object(SqueezelitePlayer, "display_name", new_callable=PropertyMock),
-        patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None),
+        patch.object(
+            SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=synced_to
+        ),
         patch.object(
             SqueezelitePlayer,
             "group_members",
@@ -266,7 +271,9 @@ async def _underrun(
         player.handle_slim_event(SlimEvent(SlimEventType.PLAYER_OUTPUT_UNDERRUN, "p1"))
         if during_wait is not None:
             await during_wait()
-        await asyncio.gather(*mass._tracked_tasks.values(), return_exceptions=True)
+        results = await asyncio.gather(*mass._tracked_tasks.values(), return_exceptions=True)
+    # a replaced task ends cancelled, which is not an Exception; anything else is a bug
+    assert not [result for result in results if isinstance(result, Exception)]
 
 
 async def test_output_underrun_resumes_playback() -> None:
@@ -336,10 +343,88 @@ async def test_output_underrun_does_not_resume_a_new_stream() -> None:
     player.client.unpause_at.assert_not_awaited()
 
 
-async def test_output_underrun_in_sync_group_is_not_resumed() -> None:
-    """A group member is not resumed on its own, which would break sync."""
+async def test_output_underrun_does_not_resume_after_stop_with_late_underrun() -> None:
+    """An underrun report that crosses a stop does not restart the stopped player."""
+    player, mass = _stalled_player()
+    player._attr_type = PlayerType.PLAYER
+
+    async def _stop() -> None:
+        # the late underrun report left the client in BUFFERING despite the stop
+        await player.stop()
+
+    await _underrun(player, mass, during_wait=_stop)
+
+    player.client.stop.assert_awaited_once()
+    player.client.unpause_at.assert_not_awaited()
+
+
+async def test_output_underrun_still_resumes_after_enqueue() -> None:
+    """Enqueueing the next track does not replace the stalled stream, so it is still resumed."""
     player, mass = _stalled_player()
 
-    await _underrun(player, mass, group_members=["p1", "p2"])
+    async def _enqueue() -> None:
+        await player.enqueue_next_media(
+            PlayerMedia(uri="fake://next", media_type=MediaType.TRACK, source_id="queue_1")
+        )
+
+    await _underrun(player, mass, during_wait=_enqueue)
+
+    player.client.unpause_at.assert_awaited_once_with(123456)
+
+
+async def test_output_underrun_does_not_resume_a_disconnected_player() -> None:
+    """A player that disconnected while rebuffering is left alone."""
+    player, mass = _stalled_player()
+
+    async def _disconnect() -> None:
+        player.client.connected = False
+
+    await _underrun(player, mass, during_wait=_disconnect)
 
     player.client.unpause_at.assert_not_awaited()
+    assert not any("did not resume" in message for message in _logged(player.logger.warning))
+
+
+async def test_newer_output_underrun_replaces_a_pending_resume() -> None:
+    """A second underrun while a resume is pending results in a single resume."""
+    player, mass = _stalled_player()
+
+    async def _underrun_again() -> None:
+        player.handle_slim_event(SlimEvent(SlimEventType.PLAYER_OUTPUT_UNDERRUN, "p1"))
+
+    await _underrun(player, mass, during_wait=_underrun_again)
+
+    player.client.unpause_at.assert_awaited_once_with(123456)
+
+
+async def test_resume_is_not_credited_to_a_new_stream() -> None:
+    """A new stream that starts after the resume was sent is not reported as recovered."""
+    player, mass = _stalled_player()
+
+    async def _ignore_resume_and_start_new_stream(_timestamp: int) -> None:
+        await player.play_media(
+            PlayerMedia(uri="fake://x", media_type=MediaType.TRACK, source_id="queue_1")
+        )
+        player.client.state = SlimPlayerState.PLAYING
+
+    player.client.unpause_at.side_effect = _ignore_resume_and_start_new_stream
+
+    await _underrun(player, mass)
+
+    assert not any("resumed playback" in message for message in _logged(player.logger.info))
+    assert not any("did not resume" in message for message in _logged(player.logger.warning))
+
+
+@pytest.mark.parametrize(
+    ("group_members", "synced_to"), [(["p1", "p2"], None), ([], "leader")], ids=["leader", "member"]
+)
+async def test_output_underrun_in_sync_group_is_not_resumed(
+    group_members: list[str], synced_to: str | None
+) -> None:
+    """A group player is not resumed on its own, which would break sync, but it is reported."""
+    player, mass = _stalled_player()
+
+    await _underrun(player, mass, group_members=group_members, synced_to=synced_to)
+
+    player.client.unpause_at.assert_not_awaited()
+    assert any("sync group" in message for message in _logged(player.logger.warning))

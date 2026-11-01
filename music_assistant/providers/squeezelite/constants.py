@@ -26,6 +26,9 @@ MIN_REQ_PLAYPOINTS = 8  # we need at least 8 measurements
 DEVIATION_JUMP_IGNORE = 500  # ignore a sudden unrealistic jump
 MAX_SKIP_AHEAD_MS = 800  # 0.8 seconds
 
+# seconds a player gets to rebuffer after an output underrun before it is told to resume
+UNDERRUN_RESUME_DELAY = 2.0
+
 STATE_MAP = {
     SlimPlayerState.BUFFERING: PlaybackState.PLAYING,
     SlimPlayerState.BUFFER_READY: PlaybackState.PLAYING,

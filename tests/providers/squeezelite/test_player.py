@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
+from aioslimproto.models import EventType as SlimEventType
 from aioslimproto.models import PlayerState as SlimPlayerState
+from aioslimproto.models import SlimEvent
 from music_assistant_models.enums import MediaType, PlaybackState
 from music_assistant_models.player import PlayerMedia
 
@@ -218,3 +221,95 @@ async def test_play_media_drops_heartbeat_from_before_the_flush() -> None:
         )
 
     assert player._attr_elapsed_time == 0
+
+
+def _stalled_player() -> tuple[SqueezelitePlayer, MagicMock]:
+    """Return a single player whose client just reported an output underrun."""
+    player, mass = _player_with_mocked_mass()
+    use_real_create_task(mass)
+    player.logger = MagicMock()
+    player.multi_client_stream = None
+    player._extra_data = {}
+    player._stream_generation = 0
+    player._provider = MagicMock(mass=mass)
+    player.client = client = MagicMock(state=SlimPlayerState.BUFFERING, jiffies=123456)
+    client.unpause_at = AsyncMock()
+    client.play_url = AsyncMock()
+    mass.players.get_player.return_value = player
+    mass.player_queues.get.return_value = None
+    mass.streams.resolve_stream_url = AsyncMock(return_value="http://127.0.0.1:8097/x.flac")
+    return player, mass
+
+
+async def _underrun(
+    player: SqueezelitePlayer,
+    mass: MagicMock,
+    during_wait: Any = None,
+    group_members: list[str] | None = None,
+) -> None:
+    """Report an output underrun and wait for the provider to handle it."""
+    with (
+        patch("music_assistant.providers.squeezelite.player.UNDERRUN_RESUME_DELAY", 0.05),
+        patch.object(SqueezelitePlayer, "display_name", new_callable=PropertyMock),
+        patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None),
+        patch.object(
+            SqueezelitePlayer,
+            "group_members",
+            new_callable=PropertyMock,
+            return_value=group_members or [],
+        ),
+        patch.object(SqueezelitePlayer, "player_id", new_callable=PropertyMock, return_value="p1"),
+        patch.object(player, "update_attributes"),
+        patch.object(player, "update_state"),
+    ):
+        player.handle_slim_event(SlimEvent(SlimEventType.PLAYER_OUTPUT_UNDERRUN, "p1"))
+        if during_wait is not None:
+            await during_wait()
+        await asyncio.gather(*mass._tracked_tasks.values(), return_exceptions=True)
+
+
+async def test_output_underrun_resumes_playback() -> None:
+    """A player that ran out of audio is told to resume once it has rebuffered."""
+    player, mass = _stalled_player()
+
+    await _underrun(player, mass)
+
+    player.client.unpause_at.assert_awaited_once_with(123456)
+
+
+@pytest.mark.parametrize("new_state", [SlimPlayerState.PAUSED, SlimPlayerState.STOPPED])
+async def test_output_underrun_does_not_resume_after_pause_or_stop(
+    new_state: SlimPlayerState,
+) -> None:
+    """A pause or stop while the player rebuffers is not undone."""
+    player, mass = _stalled_player()
+
+    async def _leave_buffering() -> None:
+        player.client.state = new_state
+
+    await _underrun(player, mass, during_wait=_leave_buffering)
+
+    player.client.unpause_at.assert_not_awaited()
+
+
+async def test_output_underrun_does_not_resume_a_new_stream() -> None:
+    """A stream started while the player rebuffers is left to its own buffer-ready start."""
+    player, mass = _stalled_player()
+
+    async def _start_new_stream() -> None:
+        await player.play_media(
+            PlayerMedia(uri="fake://x", media_type=MediaType.TRACK, source_id="queue_1")
+        )
+
+    await _underrun(player, mass, during_wait=_start_new_stream)
+
+    player.client.unpause_at.assert_not_awaited()
+
+
+async def test_output_underrun_in_sync_group_is_not_resumed() -> None:
+    """A group member is not resumed on its own, which would break sync."""
+    player, mass = _stalled_player()
+
+    await _underrun(player, mass, group_members=["p1", "p2"])
+
+    player.client.unpause_at.assert_not_awaited()

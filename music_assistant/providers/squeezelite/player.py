@@ -55,6 +55,7 @@ from .constants import (
     MIN_REQ_PLAYPOINTS,
     REPEATMODE_MAP,
     STATE_MAP,
+    UNDERRUN_RESUME_DELAY,
     SyncPlayPoint,
 )
 from .multi_client_stream import MultiClientStream
@@ -132,6 +133,8 @@ class SqueezelitePlayer(Player):
         self._do_not_resync_before: float = 0.0
         self._audio_source_active: bool = False
         self._low_latency_stream: bool = False
+        # bumped for every new stream so a pending underrun resume can tell it is stale
+        self._stream_generation: int = 0
         # TEMP: patch slimclient send_strm to adjust buffer thresholds
         # this can be removed when we did a new release of aioslimproto with this change
         # after this has been tested in beta for a while
@@ -447,6 +450,9 @@ class SqueezelitePlayer(Player):
             self.mass.create_task(self._handle_player_cli_event(event))
             return
 
+        if event.type == SlimEventType.PLAYER_OUTPUT_UNDERRUN:
+            self.mass.create_task(self._handle_output_underrun())
+
         # all other: update attributes and update state
         self.update_attributes()
         self.update_state()
@@ -523,6 +529,8 @@ class SqueezelitePlayer(Player):
         if isinstance(target_player, SqueezelitePlayer):
             target_player._audio_source_active = audio_source_active
             target_player._low_latency_stream = low_latency_stream
+            if not enqueue:
+                target_player._stream_generation += 1
         await slimplayer.play_url(
             url=url,
             mime_type=get_mime_type(url.rsplit(".", maxsplit=1)[-1].split("?", maxsplit=1)[0]),
@@ -614,6 +622,29 @@ class SqueezelitePlayer(Player):
                 # Instead just start playback on all players and let the sync logic work out
                 # the delays etc.
                 tg.create_task(pause_and_unpause(sync_client, 200))
+
+    async def _handle_output_underrun(self) -> None:
+        """Resume a player that ran out of audio in the middle of a stream."""
+        if self.synced_to or self.group_members:
+            # resuming one member on its own would break sync with the rest of the group
+            return
+        self.logger.warning(
+            "%s ran out of audio, resuming playback in %s seconds",
+            self.display_name,
+            UNDERRUN_RESUME_DELAY,
+        )
+        stream_generation = self._stream_generation
+        # Streams started with autostart off wait for an unpause after an underrun, even
+        # once their buffer is full again. The player keeps buffering while we wait, so
+        # it resumes with more headroom than it had before.
+        await asyncio.sleep(UNDERRUN_RESUME_DELAY)
+        if (
+            self.client.state != SlimPlayerState.BUFFERING
+            or self._stream_generation != stream_generation
+        ):
+            # paused, stopped or replaced by a new stream in the meantime
+            return
+        await self.client.unpause_at(self.client.jiffies)
 
     async def _handle_player_cli_event(self, event: SlimEvent) -> None:
         """Process CLI Event."""

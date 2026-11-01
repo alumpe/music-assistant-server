@@ -385,6 +385,17 @@ async def test_output_underrun_does_not_resume_a_disconnected_player() -> None:
     assert not any("did not resume" in message for message in _logged(player.logger.warning))
 
 
+async def test_output_underrun_without_a_stream_from_this_connection_is_ignored() -> None:
+    """An underrun of a stream from before a reconnect or server restart is not resumed."""
+    player, mass = _stalled_player()
+    player.client.current_media = None
+
+    await _underrun(player, mass)
+
+    player.client.unpause_at.assert_not_awaited()
+    assert not player.logger.warning.called
+
+
 async def test_newer_output_underrun_replaces_a_pending_resume() -> None:
     """A second underrun while a resume is pending results in a single resume."""
     player, mass = _stalled_player()

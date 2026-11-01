@@ -632,6 +632,13 @@ class SqueezelitePlayer(Player):
 
     async def _handle_output_underrun(self) -> None:
         """Resume a player that ran out of audio in the middle of a stream."""
+        if self.client.current_media is None:
+            # e.g. a player reconnecting after a server restart reports the end of the
+            # previous server's stream; there is nothing of ours to resume
+            self.logger.debug(
+                "%s ran out of audio outside a stream we started, ignoring", self.display_name
+            )
+            return
         if self.synced_to or self.group_members:
             # resuming one member on its own would break sync with the rest of the group
             self.logger.warning(

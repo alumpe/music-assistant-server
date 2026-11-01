@@ -55,6 +55,7 @@ from .constants import (
     MIN_REQ_PLAYPOINTS,
     REPEATMODE_MAP,
     STATE_MAP,
+    UNDERRUN_RESUME_CHECK_DELAY,
     UNDERRUN_RESUME_DELAY,
     SyncPlayPoint,
 )
@@ -627,6 +628,9 @@ class SqueezelitePlayer(Player):
         """Resume a player that ran out of audio in the middle of a stream."""
         if self.synced_to or self.group_members:
             # resuming one member on its own would break sync with the rest of the group
+            self.logger.debug(
+                "%s ran out of audio in a sync group, not resuming", self.display_name
+            )
             return
         self.logger.warning(
             "%s ran out of audio, resuming playback in %s seconds",
@@ -638,13 +642,32 @@ class SqueezelitePlayer(Player):
         # once their buffer is full again. The player keeps buffering while we wait, so
         # it resumes with more headroom than it had before.
         await asyncio.sleep(UNDERRUN_RESUME_DELAY)
-        if (
-            self.client.state != SlimPlayerState.BUFFERING
-            or self._stream_generation != stream_generation
-        ):
-            # paused, stopped or replaced by a new stream in the meantime
+        if self._stream_generation != stream_generation:
+            self.logger.debug(
+                "%s started a new stream, not resuming the old one", self.display_name
+            )
+            return
+        if self.client.state != SlimPlayerState.BUFFERING:
+            self.logger.debug(
+                "%s is %s, not resuming after running out of audio",
+                self.display_name,
+                self.client.state.value,
+            )
             return
         await self.client.unpause_at(self.client.jiffies)
+        # A player that ignores the unpause stays silent and, still buffering, has its
+        # next underrun dropped by aioslimproto, so report the outcome explicitly.
+        await asyncio.sleep(UNDERRUN_RESUME_CHECK_DELAY)
+        if self.client.state == SlimPlayerState.PLAYING:
+            self.logger.info("%s resumed playback after running out of audio", self.display_name)
+        elif (
+            self.client.state == SlimPlayerState.BUFFERING
+            and self._stream_generation == stream_generation
+        ):
+            self.logger.warning(
+                "%s did not resume after running out of audio and is still silent",
+                self.display_name,
+            )
 
     async def _handle_player_cli_event(self, event: SlimEvent) -> None:
         """Process CLI Event."""

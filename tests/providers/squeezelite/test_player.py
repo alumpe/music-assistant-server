@@ -250,6 +250,7 @@ async def _underrun(
     """Report an output underrun and wait for the provider to handle it."""
     with (
         patch("music_assistant.providers.squeezelite.player.UNDERRUN_RESUME_DELAY", 0.05),
+        patch("music_assistant.providers.squeezelite.player.UNDERRUN_RESUME_CHECK_DELAY", 0.05),
         patch.object(SqueezelitePlayer, "display_name", new_callable=PropertyMock),
         patch.object(SqueezelitePlayer, "synced_to", new_callable=PropertyMock, return_value=None),
         patch.object(
@@ -275,6 +276,35 @@ async def test_output_underrun_resumes_playback() -> None:
     await _underrun(player, mass)
 
     player.client.unpause_at.assert_awaited_once_with(123456)
+
+
+def _logged(log_method: MagicMock) -> list[str]:
+    """Return the format strings passed to a mocked logger method."""
+    return [call.args[0] for call in log_method.call_args_list]
+
+
+async def test_output_underrun_logs_a_confirmed_resume() -> None:
+    """A resume the player confirms is logged as recovered, not as a failure."""
+    player, mass = _stalled_player()
+
+    async def _confirm_resume(_timestamp: int) -> None:
+        player.client.state = SlimPlayerState.PLAYING
+
+    player.client.unpause_at.side_effect = _confirm_resume
+
+    await _underrun(player, mass)
+
+    assert any("resumed playback" in message for message in _logged(player.logger.info))
+    assert not any("did not resume" in message for message in _logged(player.logger.warning))
+
+
+async def test_output_underrun_logs_a_resume_the_player_ignores() -> None:
+    """A player that stays silent after the resume is reported, so a failed recovery shows."""
+    player, mass = _stalled_player()
+
+    await _underrun(player, mass)
+
+    assert any("did not resume" in message for message in _logged(player.logger.warning))
 
 
 @pytest.mark.parametrize("new_state", [SlimPlayerState.PAUSED, SlimPlayerState.STOPPED])

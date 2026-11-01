@@ -28,6 +28,8 @@ MAX_SKIP_AHEAD_MS = 800  # 0.8 seconds
 
 # seconds a player gets to rebuffer after an output underrun before it is told to resume
 UNDERRUN_RESUME_DELAY = 2.0
+# seconds a resumed player gets to confirm playback before the resume is reported as failed
+UNDERRUN_RESUME_CHECK_DELAY = 3.0
 
 STATE_MAP = {
     SlimPlayerState.BUFFERING: PlaybackState.PLAYING,
